@@ -1,10 +1,25 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:http/http.dart' as http;
+import 'package:exif/exif.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:image/image.dart' as img;
 
-void main() {
+Future<void> _requestPermissions() async {
+  await [
+    Permission.camera,
+    Permission.locationWhenInUse,
+  ].request();
+}
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await _requestPermissions();
   runApp(const MyApp());
 }
 
@@ -61,6 +76,8 @@ class MyHomePage extends StatefulWidget {
 class _MyHomePageState extends State<MyHomePage> {
   final int _counter = 0;
 
+  final GeolocatorPlatform _geolocatorPlatform = GeolocatorPlatform.instance;
+
   CameraController? controller;
   List<CameraDescription>? _cameras;
 
@@ -95,12 +112,11 @@ class _MyHomePageState extends State<MyHomePage> {
 
   String? imagePath;
 
-  void _confirmPhoto() {
+  Future<void> _confirmPhoto() async {
     // Handle the confirmed photo (e.g., upload or save permanently)
-    print('Photo confirmed: $imagePath');
-    setState(() {
-      imagePath = null;
-    });
+    if (imagePath != null) {
+      await extractAndSendMetadata(imagePath!);
+    }
   }
 
   @override
@@ -132,10 +148,12 @@ class _MyHomePageState extends State<MyHomePage> {
     });
   }
 
-  Future<void> _takePhoto() async {
+  Future<void> takePhoto() async {
     if (controller != null && controller!.value.isInitialized) {
       try {
         final XFile picture = await controller!.takePicture();
+        await getLocation();
+        await _addLocationToImage(picture.path);
         setState(() {
           print('Photo taken: ${picture.path}');
           imagePath = picture.path;
@@ -167,6 +185,169 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
+  Future<void> initializeCameras() async {
+    try {
+      final cameras = await availableCameras();
+      if (cameras.isNotEmpty) {
+        controller = CameraController(
+          cameras.first,
+          ResolutionPreset.high,
+        );
+        await controller?.initialize();
+      }
+    } catch (e) {
+      print('Error initializing camera: $e');
+      showCameraErrorDialog();
+    }
+  }
+
+  void showCameraErrorDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Camera Error'),
+        content: const Text('An error occurred while initializing the camera. Please try again.'),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              initializeCameras();
+            },
+            child: const Text('Retry'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    controller?.dispose();
+    super.dispose();
+  }
+
+  Future<void> sendToServer(File imageFile, double lat, double lon) async {
+    var uri = Uri.parse('https://your-server-endpoint.com/upload');
+    var request = http.MultipartRequest('POST', uri)
+      ..fields['latitude'] = lat.toString()
+      ..fields['longitude'] = lon.toString()
+      ..files.add(await http.MultipartFile.fromPath('image', imageFile.path));
+    var response = await request.send();
+    if (response.statusCode == 200) {
+      print('Upload successful');
+    } else {
+      print('Upload failed with status: ${response.statusCode}');
+    }
+  }
+
+  double convertDMSToDD(IfdTag? dms, IfdTag? ref) {
+    if (dms == null || ref == null) return 0.0;
+    List<String> dmsList = dms.printable.split(',');
+    double degrees = double.parse(dmsList[0].split('/')[0]) / double.parse(dmsList[0].split('/')[1]);
+    double minutes = double.parse(dmsList[1].split('/')[0]) / double.parse(dmsList[1].split('/')[1]);
+    double seconds = double.parse(dmsList[2].split('/')[0]) / double.parse(dmsList[2].split('/')[1]);
+    double dd = degrees + (minutes / 60) + (seconds / 3600);
+    if (ref.printable.contains('S') || ref.printable.contains('W')) {
+      dd = -dd;
+    }
+    return dd;
+  }
+
+  Position? currentLocation;
+
+  Future<void> getLocation() async {
+    Position position = await _geolocatorPlatform.getCurrentPosition();
+    currentLocation = position;
+  }
+
+  Future<void> extractAndSendMetadata(String imagePath) async {
+    try {
+      File imageFile = File(imagePath);
+      List<int> bytes = await imageFile.readAsBytes();
+      Map<String, IfdTag> data = await readExifFromBytes(bytes);
+      print(data);
+      if (data.isNotEmpty && currentLocation != null) {
+        double lat = currentLocation!.latitude;
+        double lon = currentLocation!.longitude;
+        // var lat = convertDMSToDD(data['GPS GPSLatitude'], data['GPS GPSLatitudeRef']);
+        // var lon = convertDMSToDD(data['GPS GPSLongitude'], data['GPS GPSLongitudeRef']);
+        print('Latitude: $lat, Longitude: $lon');
+        await sendToServer(imageFile, lat, lon);
+      } else {
+        print('No EXIF data found');
+      }
+    } catch (e) {
+      print('Error extracting EXIF data: $e');
+    }
+  }
+
+  List<String> _decimalToDMS(double decimal) {
+    final degrees = decimal.abs().floor();
+    final minutes = ((decimal.abs() - degrees) * 60).floor();
+    final seconds = (((decimal.abs() - degrees) * 60 - minutes) * 60).round();
+
+    return [
+      '$degrees/1',
+      '$minutes/1',
+      '$seconds/1',
+    ];
+  }
+
+  Future<void> _addLocationToImage(String imagePath) async {
+    if (currentLocation == null) {
+      print('No location data available');
+      return;
+    }
+
+    // Read the existing EXIF data
+    File imageFile = File(imagePath);
+    Uint8List bytes = await imageFile.readAsBytes();
+    img.Image? image = img.decodeImage(bytes);
+
+    if (image == null) {
+      print('Error reading image');
+      return;
+    }
+
+    final exifData = await readExifFromBytes(bytes);
+    // Add GPS data to the EXIF data
+    final gpsLatitude = _decimalToDMS(currentLocation!.latitude);
+    final gpsLongitude = _decimalToDMS(currentLocation!.longitude);
+
+    exifData['GPS GPSLatitude'] = IfdTag(
+      tag: 0x0002,
+      tagType: 'RATIONAL',
+      printable: gpsLatitude.join(', '),
+      values: IfdRatios(gpsLatitude.map((v) => Ratio(int.parse(v.split('/')[0]), int.parse(v.split('/')[1]))).toList()),
+    );
+
+    exifData['GPS GPSLongitude'] = IfdTag(
+      tag: 0x0004,
+      tagType: 'RATIONAL',
+      printable: gpsLongitude.join(', '),
+      values:
+          IfdRatios(gpsLongitude.map((v) => Ratio(int.parse(v.split('/')[0]), int.parse(v.split('/')[1]))).toList()),
+    );
+
+    exifData['GPS GPSLatitudeRef'] = IfdTag(
+      tag: 0x0001,
+      tagType: 'ASCII',
+      printable: currentLocation!.latitude >= 0 ? 'N' : 'S',
+      values: IfdInts([currentLocation!.latitude >= 0 ? 78 : 83]), // ASCII for 'N' and 'S'
+    );
+
+    exifData['GPS GPSLongitudeRef'] = IfdTag(
+      tag: 0x0003,
+      tagType: 'ASCII',
+      printable: currentLocation!.longitude >= 0 ? 'E' : 'W',
+      values: IfdInts([currentLocation!.longitude >= 0 ? 69 : 87]), // ASCII for 'E' and 'W'
+    );
+
+    // Write the updated EXIF data back to the image
+    final updatedBytes = img.encodeJpg(image);
+    await imageFile.writeAsBytes(updatedBytes);
+  }
+
   @override
   Widget build(BuildContext context) {
     print('imgae path');
@@ -190,16 +371,16 @@ class _MyHomePageState extends State<MyHomePage> {
                   width: 90.0, // Set the desired width
                   height: 90.0, // Set the desired height
                   child: FloatingActionButton(
-                    backgroundColor: Colors.grey[600],
+                    backgroundColor: Colors.grey[500],
                     shape: const CircleBorder(eccentricity: 0.8),
-                    onPressed: _takePhoto,
+                    onPressed: takePhoto,
                     tooltip: 'Camera',
-                    child: Icon(size: 60, Icons.camera, color: Colors.grey[400]), // Use camera icon
+                    child: Icon(size: 60, Icons.camera, color: Colors.grey[100]), // Use camera icon
                   ),
                 ),
               ),
-            ),
-          if (imagePath != null)
+            )
+          else
             Align(
               alignment: Alignment.bottomCenter,
               child: Padding(
