@@ -116,6 +116,9 @@ class _MyHomePageState extends State<MyHomePage> {
     // Handle the confirmed photo (e.g., upload or save permanently)
     if (imagePath != null) {
       await extractAndSendMetadata(imagePath!);
+      setState(() {
+        imagePath = null;
+      });
     }
   }
 
